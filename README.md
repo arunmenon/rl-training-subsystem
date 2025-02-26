@@ -1,11 +1,5 @@
 # RL Training Subsystem – README
 
-Welcome to the **RL Training Subsystem**, an end-to-end workflow for running Reinforcement Learning (RL) jobs—particularly with **GRPO** training—across a distributed fleet of VMs. Below is a comprehensive overview of all major components, including how they fit together, what each does, and how to adapt the system to your needs.
-
-This README is **designed to be very intuitive**, highlighting key architecture points, configuration settings, and extensibility tips.
-
----
-
 ## Table of Contents
 1. [High-Level Flow](#high-level-flow)  
 2. [Components Overview](#components-overview)  
@@ -199,4 +193,3 @@ These tables are crucial for orchestration:
 
 ---
 
-**We hope this gives you a clear, intuitive grasp of the RL Training Subsystem.** You can easily **extend** it with new reward functions, different scheduling logic, or custom data pipelines—while relying on the same robust, scalable core. Happy training!
