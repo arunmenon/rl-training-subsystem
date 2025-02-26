@@ -1,0 +1,12 @@
+[Unit]
+Description=Job Tracker Daemon Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /path/to/src/job_tracker.py
+Restart=on-failure
+User=your_user
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

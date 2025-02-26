@@ -1,0 +1,8 @@
+sqlalchemy
+psycopg2-binary
+torch
+transformers
+datasets
+trl
+nats-py
+paramiko
