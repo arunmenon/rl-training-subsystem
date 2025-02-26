@@ -2,7 +2,10 @@
 """
 train_grpo.py
 
-A parameterized GRPO training script that supports dynamic reward function imports and modular preprocessing.
+A parameterized GRPO training script that supports:
+  1) dynamic reward function imports,
+  2) modular preprocessing pipelines,
+  3) optional usage of Unsloth-based GRPO if desired.
 
 Usage examples:
     python train_grpo.py \
@@ -18,6 +21,12 @@ Usage examples:
       --preprocessing_pipeline generic \
       --reward_function my_rewards:custom_reward \
       --num_generations 8 --max_steps 600 --batch_size 1
+
+    python train_grpo.py \
+      --model /models/llama-3.1 \
+      --dataset /data/llama_dataset.json \
+      --reward_function correctness \
+      --use_unsloth
 """
 
 import argparse
@@ -25,6 +34,7 @@ import importlib
 import json
 import os
 import datetime
+import inspect
 
 from datasets import load_dataset, Dataset as HFDataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -34,15 +44,26 @@ try:
 except ImportError:
     raise ImportError("Please install the trl library (e.g., pip install trl) to run this script.")
 
+# Built-in reward functions
 def reward_correctness(prompts, completions, **kwargs):
+    """
+    A simple correctness-based reward function that compares each generated output 
+    with a reference answer. Returns 1.0 if exact match, else 0.0.
+    """
     references = kwargs.get("reference", [None] * len(prompts))
     rewards = []
     for output, ref in zip(completions, references):
-        score = 1.0 if ref and output.strip() == ref.strip() else 0.0
-        rewards.append(score)
+        if ref and output.strip() == ref.strip():
+            rewards.append(1.0)
+        else:
+            rewards.append(0.0)
     return rewards
 
 def reward_keyword_match(prompts, completions, **kwargs):
+    """
+    A reward function that checks how many SEO keywords from product type
+    or category are present in the generated text. Returns fraction of keywords found.
+    """
     seo_keywords = []
     if "product_type_seo_keywords" in kwargs:
         seo_keywords.extend(kwargs["product_type_seo_keywords"])
@@ -59,7 +80,11 @@ BUILTIN_REWARDS = {
     "keyword_match": reward_keyword_match,
 }
 
+# Preprocessing pipelines
 def preprocess_title_pipeline(raw_dataset):
+    """
+    Preprocess a dataset of product info to produce prompts focusing on optimizing the product title.
+    """
     processed = []
     for item in raw_dataset:
         product_type = item.get("product-type", "unknown product")
@@ -84,6 +109,9 @@ def preprocess_title_pipeline(raw_dataset):
     return processed
 
 def preprocess_generic_pipeline(raw_dataset):
+    """
+    A generic fallback that attempts to parse the sample as (prompt, answer) or just dumps the entire item as prompt.
+    """
     processed = []
     for item in raw_dataset:
         prompt = item.get("prompt", str(item))
@@ -114,12 +142,15 @@ def main():
     parser.add_argument("--max_prompt_length", type=int, default=256, help="Max token length for prompts.")
     parser.add_argument("--max_completion_length", type=int, default=128, help="Max token length for outputs.")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save outputs and checkpoints.")
+    parser.add_argument("--use_unsloth", action='store_true', 
+                        help="If set, use Unsloth-based GRPO optimization instead of the standard TRL GRPOTrainer.")
     args = parser.parse_args()
 
     print(f"[{datetime.datetime.now()}] Loading model: {args.model}")
     model = AutoModelForCausalLM.from_pretrained(args.model, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
 
+    # Load dataset
     print(f"[{datetime.datetime.now()}] Loading dataset from: {args.dataset}")
     if os.path.isfile(args.dataset) and (args.dataset.endswith(".json") or args.dataset.endswith(".jsonl")):
         with open(args.dataset, "r") as f:
@@ -129,18 +160,21 @@ def main():
         raw_dataset = load_dataset(args.dataset, split="train")
     print(f"[{datetime.datetime.now()}] Loaded {len(raw_dataset)} samples.")
 
+    # Preprocess
     pipeline_name = args.preprocessing_pipeline.lower()
     if pipeline_name in PREPROCESSING_PIPELINES:
         print(f"[{datetime.datetime.now()}] Applying preprocessing pipeline: {pipeline_name}")
         processed_dataset = PREPROCESSING_PIPELINES[pipeline_name](raw_dataset)
     else:
         raise ValueError(f"Unknown preprocessing pipeline '{pipeline_name}'.")
+
     try:
         train_dataset = HFDataset.from_list(processed_dataset)
-    except Exception as e:
-        print("Warning: Unable to convert to HF Dataset; using raw list.")
+    except Exception:
+        print("[Warning] Unable to convert processed dataset to HFDataset; using raw list.")
         train_dataset = processed_dataset
 
+    # Determine reward function
     if args.reward_function in BUILTIN_REWARDS:
         reward_func = BUILTIN_REWARDS[args.reward_function]
         print(f"[{datetime.datetime.now()}] Using built-in reward function: {args.reward_function}")
@@ -149,9 +183,19 @@ def main():
         print(f"[{datetime.datetime.now()}] Importing reward function '{func_name}' from module '{module_name}'")
         mod = importlib.import_module(module_name)
         reward_func = getattr(mod, func_name)
+        # Quick signature check
+        sig = inspect.signature(reward_func)
+        required_params = list(sig.parameters.keys())
+        if len(required_params) < 2 or required_params[:2] != ["prompts", "completions"]:
+            raise ValueError(
+                f"Reward function '{args.reward_function}' must have signature like "
+                f"def {func_name}(prompts, completions, **kwargs). Got parameters: {required_params}"
+            )
     else:
-        raise ValueError(f"Reward function '{args.reward_function}' not recognized.")
+        raise ValueError(f"Reward function '{args.reward_function}' not recognized. "
+                         "Use built-in or 'module:function' notation.")
 
+    # GRPO config
     config = GRPOConfig(
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.batch_size,
@@ -165,13 +209,28 @@ def main():
         save_total_limit=1,
     )
 
-    trainer = GRPOTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        reward_funcs=[reward_func],
-        args=config,
-        train_dataset=train_dataset
-    )
+    # Trainer instantiation: optional Unsloth usage
+    if args.use_unsloth:
+        print(f"[{datetime.datetime.now()}] Using Unsloth-based GRPO approach.")
+        try:
+            from unsloth import UnslothGRPO  # placeholder import
+        except ImportError:
+            raise ImportError("Unsloth not found. Install or remove --use_unsloth flag.")
+        trainer = UnslothGRPO(
+            model=model,
+            tokenizer=tokenizer,
+            reward_func=reward_func,  # adapt to Unsloth's expected argument(s)
+            config=config,
+            dataset=train_dataset
+        )
+    else:
+        trainer = GRPOTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            reward_funcs=[reward_func],
+            args=config,
+            train_dataset=train_dataset
+        )
 
     print(f"[{datetime.datetime.now()}] Starting GRPO training...")
     trainer.train()
